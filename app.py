@@ -3,146 +3,181 @@ import pdfplumber
 import pandas as pd
 import re
 
-# --- CONFIGURAÇÕES GERAIS ---
-st.set_page_config(page_title="SGPWeb Pro - Extrator Limpo", page_icon="📦", layout="centered")
-
-# --- SEGURANÇA ---
+# --- CONFIGURAÇÕES ---
+st.set_page_config(page_title="SGPWeb Extrator V3", page_icon="📦", layout="wide")
 SENHA_DO_CLIENTE = "cliente2025" 
 
+# --- LOGIN ---
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
 def check_login():
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-    if st.session_state.authenticated:
-        return True
-    st.title("🔒 Acesso Restrito")
-    senha = st.text_input("Senha:", type="password")
-    if st.button("Entrar"):
-        if senha == SENHA_DO_CLIENTE:
-            st.session_state.authenticated = True
-            st.rerun()
-        else:
-            st.error("Senha incorreta.")
+    if st.session_state.authenticated: return True
+    
+    col1, col2, col3 = st.columns([1,1,1])
+    with col2:
+        st.title("🔒 Acesso Restrito")
+        senha = st.text_input("Senha de Acesso:", type="password")
+        if st.button("Entrar"):
+            if senha == SENHA_DO_CLIENTE:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Senha incorreta.")
     return False
 
-# --- MOTOR DE EXTRAÇÃO CIRÚRGICA ---
-def limpar_linha(linha):
-    """Remove caracteres indesejados e espaços extras."""
-    return linha.strip()
+# --- FUNÇÕES DE LIMPEZA E EXTRAÇÃO ---
+def limpar_string(s):
+    if not s: return ""
+    return str(s).replace('\n', ' ').strip()
 
-def processar_bloco_texto(texto_bruto):
-    """
-    Recebe o texto cru da página e isola APENAS o bloco entre 
-    'ENVIAR PARA' e 'COBRAR DE'.
-    """
-    try:
-        # 1. Tenta achar onde começa o envio
-        if "ENVIAR PARA" not in texto_bruto:
-            return None
-        
-        # Pega tudo DEPOIS de "ENVIAR PARA"
-        parte_1 = texto_bruto.split("ENVIAR PARA")[1]
-        
-        # 2. Tenta achar onde termina (no "COBRAR DE" ou "+55" ou "Brasil")
-        # A prioridade é cortar no "COBRAR DE" para evitar duplicidade
-        if "COBRAR DE" in parte_1:
-            bloco_limpo = parte_1.split("COBRAR DE")[0]
-        else:
-            # Caso de fallback se não tiver Cobrar De
-            bloco_limpo = parte_1
-            
-        # Transforma em lista de linhas removendo linhas vazias
-        linhas = [limpar_linha(l) for l in bloco_limpo.split('\n') if limpar_linha(l)]
-        
-        return linhas
-    except:
-        return None
-
-def extrair_dados_pdf(pdf_file):
-    pedidos = []
+def extrair_de_tabela(page):
+    """Estratégia 1: Tenta achar tabelas estruturadas (comum em páginas com colunas)"""
+    tabelas = page.extract_tables()
+    dados_encontrados = []
     
-    with pdfplumber.open(pdf_file) as pdf:
-        for i, page in enumerate(pdf.pages):
-            texto = page.extract_text()
-            if not texto: continue
+    for tabela in tabelas:
+        for row in tabela:
+            # Achata a linha para buscar palavras-chave
+            texto_linha = " ".join([str(x) for x in row if x]).upper()
             
-            linhas_do_bloco = processar_bloco_texto(texto)
+            # Se acharmos o cabeçalho na linha, pegamos a linha SEGUINTE
+            if "ENVIAR PARA" in texto_linha:
+                idx_linha = tabela.index(row)
+                if idx_linha + 1 < len(tabela):
+                    celula_dados = tabela[idx_linha + 1][0] # Assume coluna 0
+                    if celula_dados:
+                        linhas_texto = celula_dados.split('\n')
+                        # Filtra linhas vazias
+                        linhas_texto = [l.strip() for l in linhas_texto if l.strip()]
+                        if len(linhas_texto) >= 2:
+                             # Na tabela, geralmente linha 0 = Nome, Linha 1 = CPF/Endereço
+                            dados_encontrados.append(linhas_texto)
+    return dados_encontrados
+
+def extrair_de_texto(page):
+    """Estratégia 2: Regex flexível no texto bruto"""
+    texto = page.extract_text()
+    if not texto: return None, "Página Vazia (Imagem?)"
+
+    # Regex que procura 'ENVIAR PARA' mesmo com quebra de linha (ENVIAR\nPARA)
+    # e captura tudo até 'COBRAR DE' ou um telefone
+    padrao = r'ENVIAR\s*PARA\s*(.*?)\s*(?:COBRAR\s*DE|\+55\d{10,11}|Brasil\s*\+55)'
+    match = re.search(padrao, texto, re.DOTALL | re.IGNORECASE)
+    
+    if match:
+        bloco = match.group(1)
+        linhas = [l.strip() for l in bloco.split('\n') if l.strip()]
+        return linhas, texto # Retorna as linhas e o texto bruto para debug
+    
+    return [], texto
+
+def processar_linhas_para_pedido(linhas):
+    """Transforma uma lista de linhas sujas em um objeto de pedido limpo"""
+    if not linhas: return None
+    
+    nome = linhas[0] # Primeira linha é quase sempre o nome
+    cpf = ""
+    cep = ""
+    telefone = ""
+    endereco_parts = []
+    
+    # Remove duplicidade se o nome aparecer de novo no endereço
+    linhas_limpas = []
+    for l in linhas[1:]:
+        if nome.lower() not in l.lower(): # Só adiciona se não for repetição do nome
+            linhas_limpas.append(l)
+
+    # Processa o restante
+    for linha in linhas_limpas:
+        # CPF
+        if re.search(r'\d{3}\.?\d{3}\.?\d{3}-?\d{2}', linha):
+            # Extrai apenas os números do CPF
+            nums = re.findall(r'\d', linha)
+            if len(nums) == 11:
+                cpf = "".join(nums)
+                continue # Não adiciona CPF ao endereço
+        
+        # CEP
+        match_cep = re.search(r'\d{5}-?\d{3}', linha)
+        if match_cep:
+            cep = match_cep.group(0)
+            endereco_parts.append(linha) # Mantém linha do CEP (cidade/UF)
+            continue
             
-            if linhas_do_bloco and len(linhas_do_bloco) > 2:
-                # --- LÓGICA DE ATRIBUIÇÃO POSICIONAL ---
-                # Sabemos que no seu PDF a ordem é quase sempre:
-                # Linha 0: Nome
-                # Linha 1: CPF
-                # Linhas seguintes: Endereço
-                
-                nome = linhas_do_bloco[0] # A primeira linha é o nome
-                cpf = ""
-                cep = ""
-                telefone = ""
-                endereco_parts = []
-                
-                # Regex patterns
-                regex_cpf = r'\d{11}'
-                regex_cep = r'\d{5}-?\d{3}'
-                
-                # Começamos a varrer da segunda linha em diante (índice 1)
-                for linha in linhas_do_bloco[1:]:
-                    # Se for CPF
-                    if re.match(regex_cpf, linha.replace('.', '').replace('-', '').strip()):
-                        cpf = linha.strip() # Pega e não adiciona no endereço
-                        continue
-                        
-                    # Se for CEP (Isso geralmente contém Cidade e UF também)
-                    if re.search(regex_cep, linha):
-                        match_cep = re.search(regex_cep, linha)
-                        if match_cep:
-                            cep = match_cep.group(0)
-                        # O SGPWeb costuma pedir Cidade/UF separados, mas o endereço completo ajuda
-                        # Vamos manter essa linha no endereço para garantir que Cidade/UF vá junto
-                        endereco_parts.append(linha) 
-                        continue
-                    
-                    # Se for telefone (começa com +55 ou tem formato de cel)
-                    if "+55" in linha or re.search(r'\(\d{2}\)', linha):
-                        telefone = linha.replace('Brasil', '').strip()
-                        continue
-                        
-                    # Se não for nada disso, é parte do endereço (Rua, Bairro, etc)
-                    if "Brasil" not in linha: # Remove a palavra Brasil solta
-                        endereco_parts.append(linha)
+        # Telefone
+        if "+55" in linha or re.search(r'\(\d{2}\)\s?9?\d{4}-\d{4}', linha):
+            telefone = linha.replace("Brasil", "").strip()
+            continue
+            
+        # Endereço (o que sobrou)
+        if len(linha) > 3 and "Brasil" not in linha:
+            endereco_parts.append(linha)
 
-                # Busca telefone fora do bloco se não achou dentro (backup)
-                if not telefone:
-                    match_tel = re.search(r'\+55\d{10,11}', texto)
-                    if match_tel:
-                        telefone = match_tel.group(0)
+    return {
+        "Nome": nome,
+        "CPF": cpf,
+        "Telefone": telefone,
+        "CEP": cep,
+        "Endereço": ", ".join(endereco_parts),
+        "Email": "cliente@email.com"
+    }
 
-                # Monta o objeto final
-                pedidos.append({
-                    "Nome": nome, # Agora garantido ser a primeira linha
-                    "CPF": cpf,   # Agora garantido ser único
-                    "Telefone": telefone,
-                    "CEP": cep,
-                    "Endereço": ", ".join(endereco_parts), # Endereço limpo sem o nome
-                    "Email": "cliente@email.com" # Padrão para não dar erro na importação
-                })
-
-    return pd.DataFrame(pedidos)
-
-# --- INTERFACE ---
+# --- APP PRINCIPAL ---
 if check_login():
-    st.title("📦 Conversor SGPWeb Pro v2.0")
-    st.info("Algoritmo ajustado: Remove duplicidades de Nome e CPF.")
+    st.title("📦 Extrator SGPWeb Pro V3.0 (Híbrido)")
+    st.markdown("---")
     
-    uploaded_file = st.file_uploader("Arraste o PDF aqui", type="pdf")
+    uploaded_file = st.file_uploader("Arraste seu PDF aqui", type="pdf")
     
     if uploaded_file:
-        df = extrair_dados_pdf(uploaded_file)
+        pedidos_finais = []
+        debug_info = [] # Para armazenar logs de erro
         
-        if not df.empty:
-            st.success(f"{len(df)} pedidos processados com sucesso!")
-            st.dataframe(df) # Mostra a tabela para conferência visual
+        with pdfplumber.open(uploaded_file) as pdf:
+            barra = st.progress(0)
             
-            csv = df.to_csv(index=False, sep=";").encode('utf-8') # Usei ; que é mais seguro para Excel/SGPWeb BR
-            st.download_button("Baixar CSV Corrigido", csv, "importacao_sgpweb_v2.csv", "text/csv")
+            for i, page in enumerate(pdf.pages):
+                barra.progress((i + 1) / len(pdf.pages))
+                
+                # 1. Tenta via Tabela (Prioridade)
+                blocos_tabela = extrair_de_tabela(page)
+                if blocos_tabela:
+                    for linhas in blocos_tabela:
+                        p = processar_linhas_para_pedido(linhas)
+                        if p: 
+                            p['Origem'] = f"Pág {i+1} (Tabela)"
+                            pedidos_finais.append(p)
+                    continue # Se achou tabela, vai pra próxima página
+
+                # 2. Se não achou tabela, tenta Texto Corrido
+                linhas_texto, texto_bruto = extrair_de_texto(page)
+                if linhas_texto:
+                    p = processar_linhas_para_pedido(linhas_texto)
+                    if p:
+                        p['Origem'] = f"Pág {i+1} (Texto)"
+                        pedidos_finais.append(p)
+                else:
+                    # Guarda info para debug se falhar
+                    debug_info.append(f"Página {i+1}: Não achei padrão 'ENVIAR PARA'.\nTexto inicial: {texto_bruto[:100]}...")
+
+        # --- RESULTADOS ---
+        if pedidos_finais:
+            df = pd.DataFrame(pedidos_finais)
+            st.success(f"✅ Sucesso! {len(df)} pedidos extraídos.")
+            
+            st.dataframe(df)
+            
+            csv = df.to_csv(index=False, sep=";").encode('utf-8')
+            st.download_button("⬇️ Baixar CSV (Ponto e Vírgula)", csv, "sgpweb_import.csv", "text/csv")
         else:
-            st.warning("Nenhum pedido encontrado. Verifique se o PDF está legível.")
+            st.error("❌ Nenhum pedido encontrado.")
+            st.warning("O PDF pode ser uma imagem ou ter um layout desconhecido.")
+            
+            # --- ÁREA DE DEBUG (Salvadora) ---
+            with st.expander("🛠️ CLIQUE AQUI SE DEU ERRO (Modo Debug)"):
+                st.write("Envie o texto abaixo para o programador:")
+                if debug_info:
+                    st.text("\n---\n".join(debug_info))
+                else:
+                    st.write("O arquivo parece estar vazio ou criptografado.")
